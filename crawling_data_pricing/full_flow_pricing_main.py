@@ -2,7 +2,6 @@ import requests
 import os
 import time
 import logging
-from processing_data import process_data
 import requests
 import pandas as pd
 import random
@@ -38,41 +37,44 @@ def get_access_token(config):
         'scope': 'https://graph.microsoft.com/.default'
     }
     token_r = requests.post(token_url, data=token_data)
+    if token_r.status_code != 200:
+        logging.error(f"Failed to get access token: {token_r.status_code} {token_r.text}")
+        raise Exception(f"Failed to get access token: {token_r.status_code} {token_r.text}")
     return token_r.json()['access_token']
+
 
 def get_site_and_drive_id(site_name, config):
     access_token = get_access_token(config)
     
-    # Get Site ID
-    site_url = f"https://graph.microsoft.com/v1.0/sites/{config['domain']}:/sites/{site_name}"
     headers = {
         'Authorization': 'Bearer ' + access_token
     }
+    
+    # Get Site ID
+    site_url = f"https://graph.microsoft.com/v1.0/sites/{config['domain']}:/sites/{site_name}"
     site_response = requests.get(site_url, headers=headers)
     
     logging.info(f"Site Response Status Code: {site_response.status_code}")
-    
-    if site_response.status_code == 200:
-        site_id = site_response.json()['id']
-    else:
+    if site_response.status_code != 200:
         logging.error(f"Failed to get site ID: {site_response.status_code} {site_response.content}")
         raise Exception(f"Failed to get site ID: {site_response.status_code} {site_response.content}")
+    
+    site_id = site_response.json()['id']
     
     # Get Drive ID
     drive_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives"
     drive_response = requests.get(drive_url, headers=headers)
     
     logging.info(f"Drive Response Status Code: {drive_response.status_code}")
-    
-    if drive_response.status_code == 200:
-        drives = drive_response.json()['value']
-        # Default Document Library
-        drive_id = next(drive['id'] for drive in drives if drive['name'] == 'Documents')
-    else:
+    if drive_response.status_code != 200:
         logging.error(f"Failed to get drive ID: {drive_response.status_code} {drive_response.content}")
         raise Exception(f"Failed to get drive ID: {drive_response.status_code} {drive_response.content}")
     
+    drives = drive_response.json()['value']
+    drive_id = next(drive['id'] for drive in drives if drive['name'] == 'Documents')
+    
     return site_id, drive_id
+
 
 # def find_file(filename):
 #     logging.info(f"Searching for file: {filename}")
@@ -282,61 +284,63 @@ def wait_until_unlocked(site_id, drive_id, file_path, access_token, max_retries=
         time.sleep(wait_time)
     return False
 
-def upload_log_file(site_id, drive_id, log_file_path, config, results_df):
-    access_token = get_access_token(config)
-
-    # Step 1: Download the existing file from SharePoint
-    download_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/root:{log_file_path}:/content"
+def file_exists(site_id, drive_id, log_file_path, access_token):
+    check_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/root:{log_file_path}"
     headers = {
         'Authorization': 'Bearer ' + access_token
     }
-    
-    try:
-        response = requests.get(download_url, headers=headers)
-        response.raise_for_status()
-        existing_df = pd.read_excel(io.BytesIO(response.content))
-    except requests.exceptions.HTTPError as err:
-        if err.response.status_code == 404:
-            logging.warning("File not found. Creating a new one.")
-            existing_df = pd.DataFrame()
-        else:
-            logging.error(f"Failed to download existing log file: {err}")
-            return
-    
-    # Step 2: Append the new data to the existing DataFrame
-    combined_df = pd.concat([existing_df, results_df], ignore_index=True)
-    
-    # Convert combined DataFrame to bytes
-    combined_bytes = io.BytesIO()
-    combined_df.to_excel(combined_bytes, index=False, engine='openpyxl')
-    combined_bytes.seek(0)
-    
-    if not wait_until_unlocked(site_id, drive_id, log_file_path, access_token):
-        logging.error("File is still locked after multiple attempts. Exiting.")
+    response = requests.get(check_url, headers=headers)
+    return response.status_code == 200
+
+def upload_log_file(site_id, drive_id, log_file_path, config, results_df):
+    access_token = get_access_token(config)
+
+    if not access_token:
+        logging.error("Failed to retrieve access token.")
         return
-    
-    # Step 3: Upload the updated file back to SharePoint
-    upload_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/root:{log_file_path}:/content?@microsoft.graph.conflictBehavior=replace"
-    headers = {
-        'Authorization': 'Bearer ' + access_token,
-        'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-    }
-    
-    max_retries = 10
-    for attempt in range(max_retries):
-        response = requests.put(upload_url, headers=headers, data=combined_bytes.getvalue())
-        
-        if response.status_code == 201 or response.status_code == 200:
-            logging.info("Log file successfully uploaded to SharePoint!")
-            break
-        elif response.status_code == 423:
-            logging.warning(f"Attempt {attempt + 1} failed: Resource locked. Retrying in 5 seconds...")
-            time.sleep(5)
+
+    if file_exists(site_id, drive_id, log_file_path, access_token):
+        # Prepare data for appending
+        rows = [{"values": row.tolist()} for _, row in results_df.iterrows()]
+        data = {"index": None, "values": rows}
+
+        append_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/root:{log_file_path}:/workbook/worksheets/Sheet1/tables/Table1/rows/add"
+        headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/json'}
+
+        response = requests.post(append_url, headers=headers, json=data)
+        if response.status_code in [201, 200]:
+            logging.info("Data successfully appended to the log file on SharePoint!")
         else:
-            logging.error(f"Failed to upload log file: {response.status_code} {response.text}")
-            break
+            logging.error(f"Failed to append data: {response.status_code} {response.text}")
+            #handle_access_denied(response, config)
+    
     else:
-        logging.error("Max retries reached. Failed to upload log file.")
+        # Create and upload new log file
+        combined_bytes = io.BytesIO()
+        results_df.to_excel(combined_bytes, index=False, engine='openpyxl')
+        combined_bytes.seek(0)
+
+        upload_url = f"https://graph.microsoft.com/v1.0/sites/{site_id}/drives/{drive_id}/root:{log_file_path}:/content?@microsoft.graph.conflictBehavior=replace"
+        headers = {'Authorization': f'Bearer {access_token}', 'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'}
+
+        for attempt in range(10):
+            response = requests.put(upload_url, headers=headers, data=combined_bytes.getvalue())
+            if response.status_code in [201, 200]:
+                logging.info("Log file successfully created and uploaded!")
+                break
+            elif response.status_code == 423:
+                logging.warning(f"Resource locked. Attempt {attempt + 1} failed. Retrying...")
+                time.sleep(5)
+            elif response.status_code == 403:
+                logging.error(f"Access Denied: {response.status_code} {response.text}")
+                access_token = get_access_token(config)
+                headers['Authorization'] = f'Bearer {access_token}'
+                time.sleep(5)
+            else:
+                logging.error(f"Failed to upload log file: {response.status_code} {response.text}")
+                break
+        else:
+            logging.error("Max retries reached. Failed to upload log file.")
 
 
 # Usage
